@@ -1,4 +1,4 @@
-using JuMP, Gurobi, LinearAlgebra
+using JuMP, Gurobi, LinearAlgebra, MosekTools
 
 include("utils.jl")
 
@@ -54,10 +54,6 @@ function adaptive_pwl(Q, c)
             if count_nz > 1
                 stop_iter = false
                 push!(split_vars, (i, sum(value.(λ[i]) .* split_points[i])))
-                
-                if length(split_vars) > 4
-                    break
-                end
 
             end
         end
@@ -264,6 +260,183 @@ function spatial_branch(Q, c; branching_n = Inf)
 
     end
 
+end
+
+function kkt_branch(Q, c)
+
+    n = length(c)
+
+    Q = 2 .* Q
+
+    Qext = zeros(n+1,n+1)
+    Qext[2:end,2:end] = 1/2 .* Q
+    Qext[2:end,1] = 1/2 .* c
+    Qext[1,2:end] = 1/2 .* c
+
+    SDP = Model(optimizer_with_attributes(
+        Mosek.Optimizer,
+        MOI.Silent() => true
+    ))
+
+    @variable(SDP, Y[1:(n+1),1:(n+1)] in PSDCone())
+    @variable(SDP, x[1:n], lower_bound = 0, upper_bound = 1)
+    @variable(SDP, y[1:n], lower_bound = 0)
+    @variable(SDP, z[1:n], lower_bound = 0)
+
+    @constraint(SDP, y .- z .== -Q*x .- c)
+    @constraint(SDP, Y[1:end,1] .== [1; x])
+    @constraint(SDP, [i = 2:n+1], 0 .<= Y[2:end,i])
+    @constraint(SDP, [i = 2:n+1], Y[2:end,i] .<= Y[1,i])
+
+    # @constraint(SDP, sum(Qext .* Y) == (sum(y) + sum(c[i] * x[i] for i = 1:n))/2)
+
+    @objective(SDP, Min, sum(Qext .* Y))
+
+
+    subproblems = [(-Inf, [],[],[],[])] #(lb, F0, F1, Fy, Fz)
+
+    global_ub = Inf
+    global_lb = -Inf
+
+    incumbent_sol = nothing
+
+    iter = 0
+
+    while true
+
+        selected_subproblem_index = nothing
+        for i in eachindex(subproblems)
+            if subproblems[i][1] == global_lb
+                selected_subproblem_index = i
+            end
+        end
+
+        (subp_lb, F0, F1, Fy, Fz) = subproblems[selected_subproblem_index]
+        deleteat!(subproblems, selected_subproblem_index)
+
+        for i = 1:n
+            if i in F0
+                fix(x[i], 0, force = true)
+            elseif i in F1
+                fix(x[i], 1, force = true)
+            elseif is_fixed(x[i])
+                unfix(x[i])
+                set_lower_bound(x[i], 0)
+                set_upper_bound(x[i], 1)
+            end
+
+            if i in Fy
+                fix(y[i], 0, force = true)
+            elseif is_fixed(y[i])
+                unfix(y[i])
+                set_lower_bound(y[i], 0)
+            end
+
+            if i in Fz
+                fix(z[i], 0, force = true)
+            elseif is_fixed(z[i])
+                unfix(z[i])
+                set_lower_bound(z[i], 0)
+            end
+        end
+
+        optimize!(SDP)
+        objval = objective_value(SDP)
+
+        satisfies_complementarity = true
+        max_viol_val = -Inf
+        max_viol_idx = nothing
+        for i = 1:n
+            if value.(x[i]) * value.(z[i]) > 1e-6 && !(i in union(F1, Fy))
+                satisfies_complementarity = false
+                viol = value.(x[i]) * value.(z[i]) / (-c[i] - sum(Q[i,:] .* (Q[i,:] .< 0)))
+                if viol > max_viol_val
+                    max_viol_val = viol
+                    max_viol_idx = (i, :z)
+                end
+            end
+            if (1 - value.(x[i])) * value.(y[i]) > 1e-6 && !(i in union(F0, Fz))
+                satisfies_complementarity = false
+                viol = (1 - value.(x[i])) * value.(y[i]) / (c[i] + sum(Q[i,:] .* (Q[i,:] .> 0)))
+                if viol > max_viol_val
+                    max_viol_val = viol
+                    max_viol_idx = (i, :y)
+                end
+            end
+        end
+
+        #Update lower bound
+        global_lb = objval
+        for i in eachindex(subproblems)
+            if subproblems[i][1] < global_lb
+                global_lb = subproblems[i][1]
+            end
+        end
+
+        #Update upper bound
+        if satisfies_complementarity && objval < global_ub
+
+            incumbent_sol = value.(x)
+            global_ub = objval
+        end
+
+        if round(global_lb, digits = 2) == round(global_ub, digits = 2)
+            println("Iter: ", iter, "    ================================================")
+            println("Upper Bound: ", global_ub)
+            println("Remaining problems: ", length(subproblems))
+            println("================================================================")
+            break
+        end
+
+        #Fathom based on new upper bound
+        subproblems = filter(s -> (1 + 1e-5) * s[1] < global_ub, subproblems)
+
+        if !satisfies_complementarity
+
+            if max_viol_idx[2] == :y
+                #case (ii)
+                new_F0 = copy(F0)
+                push!(new_F0, max_viol_idx[1])
+
+                new_Fy = copy(Fy)
+                push!(new_Fy, max_viol_idx[1])
+
+                new_Fz = copy(Fz)
+                push!(new_Fz, max_viol_idx[1])
+
+                new_case_1 = (objval, new_F0, copy(F1), new_Fy, copy(Fz))
+                new_case_2 = (objval, copy(F0), copy(F1), copy(Fy), new_Fz)
+
+            elseif max_viol_idx[2] == :z
+                #case (i)
+                new_F1 = copy(F1)
+                push!(new_F1, max_viol_idx[1])
+
+                new_Fy = copy(Fy)
+                push!(new_Fy, max_viol_idx[1])
+
+                new_Fz = copy(Fz)
+                push!(new_Fz, max_viol_idx[1])
+
+                new_case_1 = (objval, copy(F0), new_F1, copy(Fy), new_Fz)
+                new_case_2 = (objval, copy(F0), copy(F1), new_Fy, copy(Fz))
+
+            end
+
+            push!(subproblems, new_case_1)
+            push!(subproblems, new_case_2)
+
+        end
+
+        iter += 1
+
+        println("Iter: ", iter, "    ================================================")
+        println("Upper Bound: ", global_ub)
+        println("Lower Bound: ", global_lb)
+        println("Remaining problems: ", length(subproblems))
+        println("================================================================")
+
+    end
 
 
 end
