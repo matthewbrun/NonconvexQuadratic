@@ -2,10 +2,14 @@ using JuMP, Gurobi, LinearAlgebra, MosekTools
 
 include("utils.jl")
 
+#TODO: warmstart from best incumbent solution
+#TODO: warmstarting works poorly when revisiting previous solution
+
 const LAMBDA_TOL = 1e-6
 
-function adaptive_pwl(Q, c)
+function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
 
+    # branching in [:SOS2, :CC, :MC, :IC, :DCC]
     n = length(c)
 
     #Compute eigendecomposition
@@ -29,9 +33,31 @@ function adaptive_pwl(Q, c)
 
     split_points = [[sum((B[:,i] .<= 0) .* B[:,i]), sum((B[:,i] .>= 0) .* B[:,i])] for i = 1:n]
 
-    λ = [[@variable(QP, lower_bound = 0, upper_bound = 1) for j = 1:length(split_points[i])] for i = 1:n]
-    @constraint(QP, λ_sum[i = 1:n], sum(λ[i]) == 1)
-    @constraint(QP, λ_y[i = 1:n], sum(λ[i] .* split_points[i]) == y[i])
+    if branching in [:SOS2, :CC]
+        λ = [[@variable(QP, lower_bound = 0, upper_bound = 1) for j = 1:length(split_points[i])] for i = 1:n]
+        @constraint(QP, λ_sum[i = 1:n], sum(λ[i]) == 1)
+        @constraint(QP, λ_y[i = 1:n], sum(λ[i] .* split_points[i]) == y[i])
+        if branching == :CC
+            z = [[@variable(QP, binary = true) for j = 1:(length(split_points[i]) - 1)] for i = 1:n]
+            @constraint(QP, z_sum[i = 1:n], sum(z[i]) == 1)
+        end
+    elseif branching in [:DCC]
+        λ = [[(@variable(QP, lower_bound = 0, upper_bound = 1), @variable(QP, lower_bound = 0, upper_bound = 1)) for j = 1:(length(split_points[i]) - 1)] for i = 1:n]
+        z = [[@variable(QP, binary = true) for j = 1:(length(split_points[i]) - 1)] for i = 1:n]
+        @constraint(QP, z_sum[i = 1:n], sum(z[i]) == 1)
+        @constraint(QP, [i = 1:n, j = 1:(length(split_points[i]) - 1)], z[i][j] == sum(λ[i][j]))
+    elseif branching in [:MC]
+        λ = [[@variable(QP) for j = 1:(length(split_points[i])-1)] for i = 1:n]
+        z = [[@variable(QP, binary = true) for j = 1:(length(split_points[i])-1)] for i = 1:n]
+
+        @constraint(QP, λ_sum[i = 1:n], sum(λ[i]) == y[i])
+        @constraint(QP, z_sum[i = 1:n], sum(z[i]) == 1)
+
+    elseif branching in [:IC]
+        λ = [[@variable(QP, lower_bound = 0, upper_bound = 1) for j = 1:(length(split_points[i])-1)] for i = 1:n]
+        z = [[@variable(QP, binary = true) for j = 1:(length(split_points[i])-1)] for i = 1:n]
+
+    end
 
     iter = 0
     stop_iter = false
@@ -40,9 +66,86 @@ function adaptive_pwl(Q, c)
     while !stop_iter
 
         sort_order = [sortperm(split_points[i]) for i = 1:n]
-        @constraint(QP, λ_SOS[i = 1:n], [λ[i][j] for j in sort_order[i]] in SOS2())
+        sorted_splits = [split_points[i][sort_order[i]] for i = 1:n]
 
-        @objective(QP, Min, sum(sum(Σ[i] * λ[i][j] * split_points[i][j]^2 for j = 1:length(split_points[i])) for i = 1:n) + sum(c[i] * x[i] for i = 1:n))
+        if branching in [:SOS2, :CC]
+            
+            if branching == :SOS2
+                @constraint(QP, λ_SOS[i = 1:n], [λ[i][j] for j in sort_order[i]] in SOS2())
+            elseif branching == :CC
+                @constraint(QP, λ_CC[i = 1:n, j = 1:length(split_points[i])], λ[i][sort_order[i][j]] <= (j < length(split_points[i]) ? z[i][j] : 0) + (j > 1 ? z[i][j - 1] : 0))
+                
+                if warmstart
+                    for i = 1:n
+                        for j = 1:(length(split_points[i])-1)
+                            set_start_value(z[i][j], (sort_order[i][j] == (length(split_points[i])) ? 1 : 0))
+                        end
+                        if sort_order[i][end] == length(split_points[i])
+                            set_start_value(z[i][length(split_points[i])-1], 1)
+                        end
+                    end
+
+                    for i = 1:n, j = 1:length(split_points[i])
+                        set_start_value(λ[i][j], (j == length(split_points[i]) ? 1 : 0))
+                    end
+                
+                end
+
+            end 
+
+            @objective(QP, Min, sum(sum(Σ[i] * λ[i][j] * split_points[i][j]^2 for j = 1:length(split_points[i])) for i = 1:n) + sum(c[i] * x[i] for i = 1:n))
+
+        elseif branching in [:DCC]
+
+            @constraint(QP, λ_sum[i = 1:n], sum(sorted_splits[i][j] * λ[i][j][1] + sorted_splits[i][j+1] * λ[i][j][2] for j = 1:(length(split_points[i])-1)) == y[i])
+
+            if warmstart
+                for i = 1:n
+                    for j = 1:(length(split_points[i])-1)
+                        set_start_value(z[i][j], sorted_splits[i][j] == split_points[i][end] ? 1 : 0)
+                        set_start_value(λ[i][j][1], sorted_splits[i][j] == split_points[i][end] ? 1 : 0)
+                    end
+                end
+            end
+
+            @objective(QP, Min, sum(sum(Σ[i] * (sorted_splits[i][j]^2 * λ[i][j][1] + sorted_splits[i][j+1]^2 * λ[i][j][2]) for j = 1:(length(split_points[i])-1)) for i = 1:n) + sum(c[i] * x[i] for i = 1:n))
+
+        elseif branching in [:MC]
+
+            @constraint(QP, λ_MC_lb[i = 1:n, j = 1:(length(split_points[i])-1)], sorted_splits[i][j] * z[i][j] <= λ[i][j])
+            @constraint(QP, λ_MC_ub[i = 1:n, j = 1:(length(split_points[i])-1)], λ[i][j] <= sorted_splits[i][j+1] * z[i][j])
+
+            if warmstart
+                for i = 1:n
+                    for j = 1:(length(split_points[i])-1)
+                        set_start_value(z[i][j], sorted_splits[i][j] == split_points[i][end] ? 1 : 0)
+                        set_start_value(λ[i][j], sorted_splits[i][j] == split_points[i][end] ? Σ[i] * split_points[i][end]^2 : 0)
+                    end
+                end
+            end
+
+            slope = [[Σ[i] * (sorted_splits[i][j+1]^2 - sorted_splits[i][j]^2)/(sorted_splits[i][j+1] - sorted_splits[i][j]) for j = 1:(length(split_points[i])-1)] for i = 1:n]
+            @objective(QP, Min, sum(sum(Σ[i] * sorted_splits[i][j]^2 * z[i][j] + slope[i][j] * (λ[i][j] - sorted_splits[i][j] * z[i][j]) for j = 1:(length(split_points[i])-1)) for i = 1:n) + sum(c[i] * x[i] for i = 1:n))
+
+        elseif branching in [:IC]
+
+            @constraint(QP, λ_sum[i = 1:n], sum((sorted_splits[i][j+1] - sorted_splits[i][j]) * λ[i][j] for j = 1:(length(split_points[i])-1)) + sorted_splits[i][1] == y[i])
+
+            @constraint(QP, λ_IC_lb[i = 1:n, j = 1:(length(split_points[i])-1)], z[i][j] <= λ[i][j])
+            @constraint(QP, λ_IC_ub[i = 1:n, j = 1:(length(split_points[i])-2)], λ[i][j+1] <= z[i][j])
+
+            if warmstart
+                for i = 1:n
+                    for j = 1:(length(split_points[i])-1)
+                        set_start_value(z[i][j], sorted_splits[i][j] <= split_points[i][end] ? 1 : 0)
+                        set_start_value(λ[i][j], sorted_splits[i][j] <= split_points[i][end] ? 1 : 0)
+                    end
+                end
+            end
+
+            @objective(QP, Min, sum(Σ[i] * sorted_splits[i][1]^2 + sum((Σ[i] * (sorted_splits[i][j+1]^2 - sorted_splits[i][j]^2)) * λ[i][j] for j = 1:(length(split_points[i])-1)) for i = 1:n) + sum(c[i] * x[i] for i = 1:n))
+            
+        end
 
         optimize!(QP)
         objval = objective_value(QP)
@@ -50,24 +153,89 @@ function adaptive_pwl(Q, c)
         stop_iter = true
         split_vars = []
         for i = 1:n
-            count_nz = sum(value.(λ[i]) .>= 1e-3)
-            if count_nz > 1
-                stop_iter = false
-                push!(split_vars, (i, sum(value.(λ[i]) .* split_points[i])))
+            if branching in [:SOS2, :CC, :DCC]
+                if branching in [:DCC]
+                    count_nz = sum(sum(value.(λ[i][j]) .>= 1e-3) for j in 1:(length(split_points[i])-1))
+                else
+                    count_nz = sum(value.(λ[i]) .>= 1e-3)
+                end
+                if count_nz > 1
+                    stop_iter = false
+                    push!(split_vars, (i, value.(y[i])))
 
+                end
+            elseif branching in [:MC]
+                lbd_diffs = [(value.(λ[i][j]) - sorted_splits[i][j] > 1e-3, sorted_splits[i][j+1] - value.(λ[i][j]) > 1e-3) for j = 1:(length(split_points[i])-1) ]
+                if any([all(lbd_diffs[j]) && value.(z[i][j]) > .5 for j = 1:(length(split_points[i])-1)])
+                    stop_iter = false
+                    push!(split_vars, (i, value.(y[i])))
+                end
+            elseif branching in [:IC]
+                err = min(1 - (sum(value.(λ[i])) % 1), sum(value.(λ[i])) % 1)
+                if err > 1e-3 
+                    stop_iter = false
+                    push!(split_vars, (i, value.(y[i])))
+                end
             end
         end
 
         for (i, val) in split_vars
             push!(split_points[i], val)
-            push!(λ[i], @variable(QP, lower_bound = 0, upper_bound = 1))
+            if branching in [:SOS2, :CC]
+                push!(λ[i], @variable(QP, lower_bound = 0, upper_bound = 1))
 
-            set_normalized_coefficient(λ_sum[i], λ[i][end], 1)
-            set_normalized_coefficient(λ_y[i], λ[i][end], val)
+                set_normalized_coefficient(λ_sum[i], λ[i][end], 1)
+                set_normalized_coefficient(λ_y[i], λ[i][end], val)
+
+                if branching == :CC
+                    push!(z[i], @variable(QP, binary = true))
+
+                    set_normalized_coefficient(z_sum[i], z[i][end], 1)
+                end
+
+            elseif branching in [:DCC]
+                push!(λ[i], (@variable(QP, lower_bound = 0, upper_bound = 1), @variable(QP, lower_bound = 0, upper_bound = 1)))
+                push!(z[i], @variable(QP, binary = true))
+
+                @constraint(QP, z[i][end] == sum(λ[i][end]))
+                set_normalized_coefficient(z_sum[i], z[i][end], 1)
+
+            elseif branching in [:MC]
+
+                push!(λ[i], @variable(QP))
+                push!(z[i], @variable(QP, binary = true))
+
+                set_normalized_coefficient(λ_sum[i], λ[i][end], 1)
+                set_normalized_coefficient(z_sum[i], z[i][end], 1)
+
+            elseif branching in [:IC]
+                push!(λ[i], @variable(QP, lower_bound = 0, upper_bound = 1))
+                push!(z[i], @variable(QP, binary = true))
+            end
         end
 
-        delete.(QP, λ_SOS)
-        unregister.(QP, :λ_SOS)
+        if branching in [:SOS2]
+            delete.(QP, λ_SOS)
+            unregister.(QP, :λ_SOS)
+        elseif branching in [:CC]
+            delete.(QP, λ_CC)
+            unregister.(QP, :λ_CC)
+        elseif branching in [:MC]
+            delete.(QP, λ_MC_lb)
+            unregister.(QP, :λ_MC_lb)
+            delete.(QP, λ_MC_ub)
+            unregister.(QP, :λ_MC_ub)
+        elseif branching in [:IC]
+            delete.(QP, λ_sum)
+            unregister.(QP, :λ_sum)
+            delete.(QP, λ_IC_lb)
+            unregister.(QP, :λ_IC_lb)
+            delete.(QP, λ_IC_ub)
+            unregister.(QP, :λ_IC_ub)
+        elseif branching in [:DCC]
+            delete.(QP, λ_sum)
+            unregister.(QP, :λ_sum)
+        end
 
 
         iter +=1 
@@ -288,10 +456,9 @@ function kkt_branch(Q, c)
     @constraint(SDP, [i = 2:n+1], 0 .<= Y[2:end,i])
     @constraint(SDP, [i = 2:n+1], Y[2:end,i] .<= Y[1,i])
 
-    # @constraint(SDP, sum(Qext .* Y) == (sum(y) + sum(c[i] * x[i] for i = 1:n))/2)
+    @constraint(SDP, sum(Qext .* Y) == (-sum(y) + sum(c[i] * x[i] for i = 1:n))/2)
 
     @objective(SDP, Min, sum(Qext .* Y))
-
 
     subproblems = [(-Inf, [],[],[],[])] #(lb, F0, F1, Fy, Fz)
 
@@ -380,7 +547,7 @@ function kkt_branch(Q, c)
             global_ub = objval
         end
 
-        if round(global_lb, digits = 2) == round(global_ub, digits = 2)
+        if round(global_lb, digits = 2) >= round(global_ub, digits = 2)
             println("Iter: ", iter, "    ================================================")
             println("Upper Bound: ", global_ub)
             println("Remaining problems: ", length(subproblems))
