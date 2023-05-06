@@ -89,7 +89,7 @@ end
 
 function evaluate_pwl(d, f, x)
 
-    lidx = findlast(<=(x), d)
+    lidx = findlast(<=(x+1e-4), d)
     if lidx == length(d)
         return f[lidx]
     end
