@@ -175,6 +175,7 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true, breakpoint_mana
                 end
             end
 
+            set_objective_sense(QP, MOI.FEASIBILITY_SENSE)
             @objective(QP, Min, sum(Σ[i] * sorted_splits[i][1]^2 + sum((Σ[i] * (sorted_splits[i][j+1]^2 - sorted_splits[i][j]^2)) * λ[i][j] for j = 1:(length(split_points[i])-1)) for i = 1:n) + sum(c[i] * x[i] for i = 1:n))
             
         end
