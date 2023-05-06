@@ -25,11 +25,6 @@ d = 1
 ss = [1, 2, 3, 4, 5]
 branchings = [:SOS2, :CC, :MC, :DCC, :IC]
 
-ns = [5]
-d = 1
-ss = [1]
-branchings = [:CC, :MC]
-
 data_file = "results/run_branching"
 
 if !isfile(string(data_file, ".csv"))
