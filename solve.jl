@@ -457,7 +457,13 @@ function spatial_branch(Q, c; branching_n = Inf)
 
     t_start = time()
 
+    solved = true
     while true
+
+        if time() - t_start > 30*60
+            solved = false
+            break
+        end
 
         t_iter_start = time()
 
@@ -607,7 +613,11 @@ function spatial_branch(Q, c; branching_n = Inf)
 
     end
 
-    tot_time = time() - t_start
+    if solved
+        tot_time = time() - t_start
+    else
+        tot_time = Inf
+    end
 
     return iter, tot_time, times, lower_bounds, upper_bounds
 
