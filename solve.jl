@@ -31,7 +31,7 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true, breakpoint_mana
 
     QP = direct_model(optimizer_with_attributes(
         Gurobi.Optimizer, 
-        MOI.Silent() => false,
+        MOI.Silent() => true,
         "MIPFocus" => 2
     ))
 
