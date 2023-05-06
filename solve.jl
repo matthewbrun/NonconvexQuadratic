@@ -76,8 +76,14 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true, breakpoint_mana
     upper_bound = Inf
     lower_bound = -Inf
 
+    lower_bounds = [lower_bound]
+    upper_bounds = [upper_bound]
+    times = []
+
     t_start = time()
     while !stop_iter
+
+        t_iter_start = time()
 
         sort_order = [sortperm(split_points[i]) for i = 1:n]
         sorted_splits = [split_points[i][sort_order[i]] for i = 1:n]
@@ -225,6 +231,9 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true, breakpoint_mana
         upper_bound = minimum(sol_objs)
         # lower_bound = -Inf
         lower_bound = max(grb_lb, lower_bound)
+
+        push!(lower_bounds, lower_bound)
+        push!(upper_bounds, upper_bound)
 
         stop_iter = true
         split_vars = []
@@ -384,6 +393,9 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true, breakpoint_mana
 
 
         iter +=1 
+        t_iter_end = time()
+
+        push!(times, t_iter_end - t_iter_start)
 
         println(repeat("=", 40))
         println("Iter: ", iter)
@@ -392,8 +404,13 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true, breakpoint_mana
         println("Lower Bound: ", lower_bound)
         println("Upper Bound: ", upper_bound)
         println("Time: ", round(time() - t_start, digits = 2))
+        println("Iter Time: ", t_iter_end - t_iter_start)
 
     end
+
+    tot_time = time() - t_start
+
+    return iter, tot_time, times, lower_bounds, upper_bounds
 
 end
 
@@ -433,7 +450,15 @@ function spatial_branch(Q, c; branching_n = Inf)
 
     iter = 0
 
+    lower_bounds = []
+    upper_bounds = []
+    times = []
+
+    t_start = time()
+
     while true
+
+        t_iter_start = time()
 
         #Select next subproblem
         selected_subproblem_index = nothing
@@ -566,6 +591,12 @@ function spatial_branch(Q, c; branching_n = Inf)
 
         iter += 1
 
+        t_iter_end = time()
+
+        push!(times, t_iter_end - t_iter_start)
+        push!(lower_bounds, global_lb)
+        push!(upper_bounds, global_ub)
+
         println("Iter: ", iter, "    ================================================")
         println("Level: ", subp_level)
         println("Upper Bound: ", global_ub)
@@ -574,6 +605,10 @@ function spatial_branch(Q, c; branching_n = Inf)
         println("================================================================")
 
     end
+
+    tot_time = time() - t_start
+
+    return iter, tot_time, times, lower_bounds, upper_bounds
 
 end
 
@@ -616,7 +651,15 @@ function kkt_branch(Q, c)
 
     iter = 0
 
+    lower_bounds = []
+    upper_bounds = []
+    times = []
+
+    t_start = time()
+
     while true
+
+        t_iter_start = time()
 
         selected_subproblem_index = nothing
         for i in eachindex(subproblems)
@@ -744,6 +787,12 @@ function kkt_branch(Q, c)
 
         iter += 1
 
+        t_iter_end = time()
+
+        push!(times, t_iter_end - t_iter_start)
+        push!(lower_bounds, global_lb)
+        push!(upper_bounds, global_ub)
+
         println("Iter: ", iter, "    ================================================")
         println("Upper Bound: ", global_ub)
         println("Lower Bound: ", global_lb)
@@ -751,6 +800,10 @@ function kkt_branch(Q, c)
         println("================================================================")
 
     end
+
+    tot_time = time() - t_start
+
+    return iter, tot_time, times, lower_bounds, upper_bounds
 
 
 end
