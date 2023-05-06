@@ -86,3 +86,14 @@ Outputs:
     return Q, c
 
 end
+
+function evaluate_pwl(d, f, x)
+
+    lidx = findlast(<=(x), d)
+    if lidx == length(d)
+        return f[lidx]
+    end
+
+    return ((x - d[lidx]) / (d[lidx + 1] - d[lidx])) * (f[lidx + 1] - f[lidx]) + f[lidx]
+
+end

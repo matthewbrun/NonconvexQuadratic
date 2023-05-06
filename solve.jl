@@ -1,4 +1,4 @@
-using JuMP, Gurobi, LinearAlgebra, MosekTools
+using JuMP, Gurobi, LinearAlgebra, MosekTools, InvertedIndices
 
 include("utils.jl")
 
@@ -7,9 +7,21 @@ include("utils.jl")
 
 const LAMBDA_TOL = 1e-6
 
-function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
+function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true, breakpoint_management = :none, max_breakpoints = 4, large_decrease_threshold = 1/2, custom_termination = true)
 
+    # breakpoint_management in [:aggressive, :standard, :none]
     # branching in [:SOS2, :CC, :MC, :IC, :DCC]
+
+    if !(branching in [:SOS2, :CC, :MC, :IC, :DCC])
+        error("Unsupported branching type")
+    end
+    if !(breakpoint_management in [:aggressive, :standard, :none])
+        error("Unsupported breakpoint management strategy")
+    end
+    if breakpoint_management != :none && !(branching in [:SOS2, :CC, :MC, :IC, :DCC])
+        error("Breakpoint management not supported with this branching style")
+    end
+
     n = length(c)
 
     #Compute eigendecomposition
@@ -17,9 +29,10 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
     B = eig.vectors
     Σ = eig.values
 
-    QP = Model(optimizer_with_attributes(
+    QP = direct_model(optimizer_with_attributes(
         Gurobi.Optimizer, 
-        MOI.Silent() => true
+        MOI.Silent() => false,
+        "MIPFocus" => 2
     ))
 
     @variable(QP, x[1:n] >= 0)
@@ -35,11 +48,9 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
 
     if branching in [:SOS2, :CC]
         λ = [[@variable(QP, lower_bound = 0, upper_bound = 1) for j = 1:length(split_points[i])] for i = 1:n]
-        @constraint(QP, λ_sum[i = 1:n], sum(λ[i]) == 1)
-        @constraint(QP, λ_y[i = 1:n], sum(λ[i] .* split_points[i]) == y[i])
+        
         if branching == :CC
             z = [[@variable(QP, binary = true) for j = 1:(length(split_points[i]) - 1)] for i = 1:n]
-            @constraint(QP, z_sum[i = 1:n], sum(z[i]) == 1)
         end
     elseif branching in [:DCC]
         λ = [[(@variable(QP, lower_bound = 0, upper_bound = 1), @variable(QP, lower_bound = 0, upper_bound = 1)) for j = 1:(length(split_points[i]) - 1)] for i = 1:n]
@@ -50,9 +61,6 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
         λ = [[@variable(QP) for j = 1:(length(split_points[i])-1)] for i = 1:n]
         z = [[@variable(QP, binary = true) for j = 1:(length(split_points[i])-1)] for i = 1:n]
 
-        @constraint(QP, λ_sum[i = 1:n], sum(λ[i]) == y[i])
-        @constraint(QP, z_sum[i = 1:n], sum(z[i]) == 1)
-
     elseif branching in [:IC]
         λ = [[@variable(QP, lower_bound = 0, upper_bound = 1) for j = 1:(length(split_points[i])-1)] for i = 1:n]
         z = [[@variable(QP, binary = true) for j = 1:(length(split_points[i])-1)] for i = 1:n]
@@ -61,6 +69,12 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
 
     iter = 0
     stop_iter = false
+
+    solutions = []
+    sol_objs = []
+
+    upper_bound = Inf
+    lower_bound = -Inf
 
     t_start = time()
     while !stop_iter
@@ -72,8 +86,14 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
             
             if branching == :SOS2
                 @constraint(QP, λ_SOS[i = 1:n], [λ[i][j] for j in sort_order[i]] in SOS2())
+                @constraint(QP, λ_y[i = 1:n], sum(λ[i] .* split_points[i]) == y[i])
+                @constraint(QP, λ_sum[i = 1:n], sum(λ[i]) == 1)
+
             elseif branching == :CC
                 @constraint(QP, λ_CC[i = 1:n, j = 1:length(split_points[i])], λ[i][sort_order[i][j]] <= (j < length(split_points[i]) ? z[i][j] : 0) + (j > 1 ? z[i][j - 1] : 0))
+                @constraint(QP, λ_sum[i = 1:n], sum(λ[i]) == 1)
+                @constraint(QP, λ_y[i = 1:n], sum(λ[i] .* split_points[i]) == y[i])
+                @constraint(QP, z_sum[i = 1:n], sum(z[i]) == 1)
                 
                 if warmstart
                     for i = 1:n
@@ -93,6 +113,7 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
 
             end 
 
+            set_objective_sense(QP, MOI.FEASIBILITY_SENSE)
             @objective(QP, Min, sum(sum(Σ[i] * λ[i][j] * split_points[i][j]^2 for j = 1:length(split_points[i])) for i = 1:n) + sum(c[i] * x[i] for i = 1:n))
 
         elseif branching in [:DCC]
@@ -115,6 +136,9 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
             @constraint(QP, λ_MC_lb[i = 1:n, j = 1:(length(split_points[i])-1)], sorted_splits[i][j] * z[i][j] <= λ[i][j])
             @constraint(QP, λ_MC_ub[i = 1:n, j = 1:(length(split_points[i])-1)], λ[i][j] <= sorted_splits[i][j+1] * z[i][j])
 
+            @constraint(QP, λ_sum[i = 1:n], sum(λ[i]) == y[i])
+            @constraint(QP, z_sum[i = 1:n], sum(z[i]) == 1)
+
             if warmstart
                 for i = 1:n
                     for j = 1:(length(split_points[i])-1)
@@ -125,6 +149,8 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
             end
 
             slope = [[Σ[i] * (sorted_splits[i][j+1]^2 - sorted_splits[i][j]^2)/(sorted_splits[i][j+1] - sorted_splits[i][j]) for j = 1:(length(split_points[i])-1)] for i = 1:n]
+
+            set_objective_sense(QP, MOI.FEASIBILITY_SENSE)
             @objective(QP, Min, sum(sum(Σ[i] * sorted_splits[i][j]^2 * z[i][j] + slope[i][j] * (λ[i][j] - sorted_splits[i][j] * z[i][j]) for j = 1:(length(split_points[i])-1)) for i = 1:n) + sum(c[i] * x[i] for i = 1:n))
 
         elseif branching in [:IC]
@@ -147,8 +173,58 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
             
         end
 
+        global grb_lb = -Inf
+
+        if custom_termination
+            function termination_callback(cb_data, cb_where::Cint)
+
+                if cb_where == GRB_CB_MIP
+
+                    objbstP = Ref{Cdouble}()
+                    objbndP = Ref{Cdouble}()
+
+                    GRBcbget(cb_data, cb_where, GRB_CB_MIP_OBJBST, objbstP)
+                    GRBcbget(cb_data, cb_where, GRB_CB_MIP_OBJBND, objbndP)
+
+                    actual_lb = max(objbndP[], lower_bound)
+
+                    gap = abs((objbstP[] - actual_lb) / objbstP[])
+                    
+                    if gap < 1e-4
+                        println("First terminate")
+                        GRBterminate(backend(QP))
+                        global grb_lb = actual_lb
+                        return
+                    end
+
+                    gap_condition = gap < .05
+
+                    ub_improve_condition = objbstP[] < upper_bound - 1e-2
+
+                    if gap_condition && ub_improve_condition
+                        GRBterminate(backend(QP))
+                        global grb_lb = actual_lb
+                        return
+                    end
+                end
+                
+
+            end
+
+            MOI.set(QP, Gurobi.CallbackFunction(), termination_callback)
+        end
+
+
+        set_optimizer_attribute(QP, "Cutoff", upper_bound)
         optimize!(QP)
         objval = objective_value(QP)
+
+        push!(solutions, (value.(y), sum(c[i] * value.(x[i]) for i = 1:n)))
+        push!(sol_objs, sum(Σ[i] * value.(y[i])^2 for i = 1:n) + sum(c[i] * value.(x[i]) for i = 1:n))
+
+        upper_bound = minimum(sol_objs)
+        # lower_bound = -Inf
+        lower_bound = max(grb_lb, lower_bound)
 
         stop_iter = true
         split_vars = []
@@ -180,16 +256,22 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
         end
 
         for (i, val) in split_vars
-            push!(split_points[i], val)
+            if breakpoint_management == :aggressive && length(split_points[i]) == max_breakpoints
+                push!(split_points[i], val)
+                deleteat!(split_points[i], 3)
+                continue
+            else
+                push!(split_points[i], val)
+            end
             if branching in [:SOS2, :CC]
                 push!(λ[i], @variable(QP, lower_bound = 0, upper_bound = 1))
 
                 set_normalized_coefficient(λ_sum[i], λ[i][end], 1)
-                set_normalized_coefficient(λ_y[i], λ[i][end], val)
 
                 if branching == :CC
                     push!(z[i], @variable(QP, binary = true))
 
+                    set_normalized_coefficient(λ_y[i], λ[i][end], val)
                     set_normalized_coefficient(z_sum[i], z[i][end], 1)
                 end
 
@@ -217,14 +299,28 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
         if branching in [:SOS2]
             delete.(QP, λ_SOS)
             unregister.(QP, :λ_SOS)
+            delete.(QP, λ_y)
+            unregister.(QP, :λ_y)
+            delete.(QP, λ_sum)
+            unregister.(QP, :λ_sum)
         elseif branching in [:CC]
             delete.(QP, λ_CC)
             unregister.(QP, :λ_CC)
+            delete.(QP, λ_sum)
+            unregister.(QP, :λ_sum)
+            delete.(QP, z_sum)
+            unregister.(QP, :z_sum)
+            delete.(QP, λ_y)
+            unregister.(QP, :λ_y)
         elseif branching in [:MC]
             delete.(QP, λ_MC_lb)
             unregister.(QP, :λ_MC_lb)
             delete.(QP, λ_MC_ub)
             unregister.(QP, :λ_MC_ub)
+            delete.(QP, λ_sum)
+            unregister.(QP, :λ_sum)
+            delete.(QP, z_sum)
+            unregister.(QP, :z_sum)
         elseif branching in [:IC]
             delete.(QP, λ_sum)
             unregister.(QP, :λ_sum)
@@ -237,6 +333,55 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
             unregister.(QP, :λ_sum)
         end
 
+        
+        sort_order = [sortperm(split_points[i]) for i = 1:n]
+        sorted_splits = [split_points[i][sort_order[i]] for i = 1:n]
+
+        if breakpoint_management == :standard
+            check_delete = true
+            while check_delete
+                check_delete = false
+                for i = n:-1:1
+                    for j = 2:(length(sorted_splits[i])-1)
+                        delete_current = true
+                        for k = 1:length(solutions)
+                            orig_obj = sum(evaluate_pwl(sorted_splits[t], Σ[t] * sorted_splits[t].^2, solutions[k][1][t]) for t = 1:n) + solutions[k][2]
+                            obj_eval = sum(evaluate_pwl(sorted_splits[t][t == i ? Not(j) : 1:end], Σ[t] * sorted_splits[t][t == i ? Not(j) : 1:end].^2, solutions[k][1][t]) for t = 1:n) + solutions[k][2]
+                            is_large_decrease = obj_eval < (upper_bound + large_decrease_threshold * (sol_objs[k] - upper_bound))
+                            if (obj_eval < upper_bound + 1e-3 && obj_eval + 1e-6 < orig_obj) || is_large_decrease
+                                delete_current = false
+                                break
+                            end
+                        end
+                        if delete_current
+                            deleteat!(split_points[i], findfirst(==(sorted_splits[i][j]), split_points[i]))
+                            if branching in [:SOS2, :CC]
+                                delete.(QP, λ[i][end])
+                                deleteat!(λ[i], length(λ[i]))
+                                if branching == :CC
+                                    delete.(QP, z[i][end])
+                                    deleteat!(z[i], length(z[i]))
+                                end
+                            elseif branching in [:MC, :IC]
+                                delete.(QP, λ[i][end])
+                                deleteat!(λ[i], length(λ[i]))
+                                delete.(QP, z[i][end])
+                                deleteat!(z[i], length(z[i]))
+                            end
+
+                            check_delete = true
+                            println("Deleted: ", (iter,i,j))
+
+                            sort_order = [sortperm(split_points[i]) for i = 1:n]
+                            sorted_splits = [split_points[i][sort_order[i]] for i = 1:n]
+                            break
+                        end
+                    end
+                end
+            end
+
+        end
+
 
         iter +=1 
 
@@ -244,6 +389,8 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true)
         println("Iter: ", iter)
         println("Num Updates: ", length(split_vars))
         println("Objective: ", objval)
+        println("Lower Bound: ", lower_bound)
+        println("Upper Bound: ", upper_bound)
         println("Time: ", round(time() - t_start, digits = 2))
 
     end
