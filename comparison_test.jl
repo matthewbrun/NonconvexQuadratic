@@ -11,7 +11,7 @@ function run_comparison_test(n, d, s)
     Q, c = build_box_concave_quadratic(n, d, seed = s, type = :negative)
 
     iter_apwl, tot_time_apwl, times, lower_bounds, upper_bounds = adaptive_pwl(
-        Q, c, branching = :MC, warmstart = true, breakpoint_management = :standard, large_decrease_threshold = 2/3, custom_termination = true
+        Q, c, branching = :MC, warmstart = true, breakpoint_management = :standard, large_decrease_threshold = 2/3, custom_termination = false
     )
 
     iter_sb, tot_time_sb, times, lower_bounds, upper_bounds = spatial_branch(

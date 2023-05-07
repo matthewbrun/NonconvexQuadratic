@@ -231,7 +231,11 @@ function adaptive_pwl(Q, c; branching = :SOS2, warmstart = true, breakpoint_mana
 
         upper_bound = minimum(sol_objs)
         # lower_bound = -Inf
-        lower_bound = max(grb_lb, lower_bound)
+        if grb_lb > -Inf
+            lower_bound = max(grb_lb, lower_bound)
+        else
+            lower_bound = max(lower_bound, objval)
+        end
 
         push!(lower_bounds, lower_bound)
         push!(upper_bounds, upper_bound)

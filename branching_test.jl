@@ -11,7 +11,7 @@ function run_branching_test(n, d, s, b)
     Q, c = build_box_concave_quadratic(n, d, seed = s, type = :negative)
 
     iter, tot_time, times, lower_bounds, upper_bounds = adaptive_pwl(
-        Q, c, branching = b, warmstart = true, breakpoint_management = :standard, large_decrease_threshold = 2/3, custom_termination = true
+        Q, c, branching = b, warmstart = true, breakpoint_management = :standard, large_decrease_threshold = 2/3, custom_termination = false
     )
 
     push!(csv_data, [n, d, s, string(b), iter, tot_time])
